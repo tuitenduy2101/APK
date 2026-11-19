@@ -1,0 +1,658 @@
+name: iOS Build
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - name: Write project files
+        run: |
+          mkdir -p proj/$(dirname project.yml)
+          cat > proj/project.yml <<'CHECKDON_EOF'
+          name: CheckDon
+          options:
+            bundleIdPrefix: com.checkdon
+            deploymentTarget:
+              iOS: "16.0"
+          packages:
+            SwiftSoup:
+              url: https://github.com/scinfu/SwiftSoup.git
+              from: 2.6.0
+          targets:
+            CheckDon:
+              type: application
+              platform: iOS
+              sources: [CheckDon]
+              dependencies:
+                - package: SwiftSoup
+              info:
+                path: CheckDon/Info.plist
+                properties:
+                  CFBundleDisplayName: Check Đơn
+                  UILaunchScreen: {}
+                  UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
+                  UIFileSharingEnabled: true
+                  LSSupportsOpeningDocumentsInPlace: true
+              settings:
+                base:
+                  PRODUCT_BUNDLE_IDENTIFIER: com.checkdon.app
+                  MARKETING_VERSION: "1.0"
+                  CURRENT_PROJECT_VERSION: "1"
+                  SWIFT_VERSION: "5.0"
+                  TARGETED_DEVICE_FAMILY: "1,2"
+          CHECKDON_EOF
+          mkdir -p proj/$(dirname CheckDon/CheckDonApp.swift)
+          cat > proj/CheckDon/CheckDonApp.swift <<'CHECKDON_EOF'
+          import SwiftUI
+
+          @main
+          struct CheckDonApp: App {
+              @StateObject private var store = OrderStore()
+              var body: some Scene {
+                  WindowGroup {
+                      ContentView().environmentObject(store)
+                  }
+              }
+          }
+          CHECKDON_EOF
+          mkdir -p proj/$(dirname CheckDon/ContentView.swift)
+          cat > proj/CheckDon/ContentView.swift <<'CHECKDON_EOF'
+          import SwiftUI
+
+          struct ContentView: View {
+              @EnvironmentObject var store: OrderStore
+              @Environment(\.scenePhase) private var scenePhase
+              @State private var showAdd = false
+              @State private var showDelay = false
+              @State private var confirmClear = false
+              @State private var selected: Order?
+              @State private var toast: String?
+
+              var body: some View {
+                  NavigationStack {
+                      VStack(spacing: 0) {
+                          if store.orders.isEmpty {
+                              Spacer()
+                              Text("Chưa có mã vận đơn.\nBấm + để nhập danh sách.")
+                                  .multilineTextAlignment(.center).foregroundStyle(.secondary)
+                              Spacer()
+                          } else {
+                              List {
+                                  ForEach(store.orders) { o in
+                                      OrderRow(order: o)
+                                          .contentShape(Rectangle())
+                                          .onTapGesture { selected = o }
+                                          .contextMenu {
+                                              Button("Copy mã") { copy(o.code) }
+                                              Button("Copy tình trạng") { copy(o.status) }
+                                              Button("Check lại đơn này") { store.check(o.id) }
+                                              Button("Xoá", role: .destructive) { store.remove(o.id) }
+                                          }
+                                          .listRowBackground(o.tint)
+                                  }
+                                  .onDelete { idx in idx.map { store.orders[$0].id }.forEach(store.remove) }
+                              }
+                              .listStyle(.plain)
+                          }
+                          bottomBar
+                      }
+                      .navigationTitle("Check Đơn")
+                      .toolbar {
+                          ToolbarItem(placement: .navigationBarLeading) {
+                              Button { showDelay = true } label: {
+                                  Label("\(store.delayMs) ms", systemImage: "timer")
+                              }
+                          }
+                          ToolbarItemGroup(placement: .navigationBarTrailing) {
+                              Menu {
+                                  Button("Copy danh sách") { copy(store.exportText) }
+                                  Button("Xoá sạch", role: .destructive) { confirmClear = true }
+                              } label: { Image(systemName: "ellipsis.circle") }
+                              Button { showAdd = true } label: { Image(systemName: "plus") }
+                          }
+                      }
+                      .sheet(isPresented: $showAdd) { AddSheet().environmentObject(store) }
+                      .sheet(isPresented: $showDelay) { DelaySheet().environmentObject(store) }
+                      .sheet(item: $selected) { DetailSheet(order: $0) }
+                      .confirmationDialog("Xoá toàn bộ danh sách?", isPresented: $confirmClear) {
+                          Button("Xoá sạch", role: .destructive) { store.clearAll() }
+                      }
+                      .onChange(of: scenePhase) { phase in
+                          // Không chạy nền: thoát app / khoá màn hình là dừng việc đang tra
+                          if phase == .background { store.cancel() }
+                      }
+                      .overlay(alignment: .top) {
+                          if let t = toast {
+                              Text(t).padding(10).background(.thinMaterial, in: Capsule()).padding(.top, 8)
+                                  .transition(.move(edge: .top).combined(with: .opacity))
+                          }
+                      }
+                  }
+              }
+
+              private var bottomBar: some View {
+                  VStack(spacing: 6) {
+                      if store.isRunning { Text("Đang kiểm tra… \(store.progress)").font(.footnote).foregroundStyle(.secondary) }
+                      HStack {
+                          if store.isRunning {
+                              Button(role: .destructive) { store.cancel() } label: {
+                                  Label("Dừng", systemImage: "stop.fill").frame(maxWidth: .infinity)
+                              }.buttonStyle(.borderedProminent)
+                          } else {
+                              Button { store.checkAll() } label: {
+                                  Label("Lấy data", systemImage: "arrow.down.circle").frame(maxWidth: .infinity)
+                              }.buttonStyle(.borderedProminent).disabled(store.orders.isEmpty)
+
+                              Button { store.retryFailed() } label: {
+                                  Label("Check lại (\(store.failedCount))", systemImage: "arrow.clockwise").frame(maxWidth: .infinity)
+                              }.buttonStyle(.bordered).tint(.orange).disabled(store.failedCount == 0)
+                          }
+                      }
+                  }
+                  .padding().background(.bar)
+              }
+
+              private func copy(_ s: String) {
+                  UIPasteboard.general.string = s
+                  withAnimation { toast = "Đã copy!" }
+                  DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { withAnimation { toast = nil } }
+              }
+          }
+
+          extension Order {
+              var tint: Color {
+                  switch state {
+                  case .error: return Color.pink.opacity(0.25)
+                  case .idle, .loading: return Color.clear
+                  case .ok:
+                      let s = status.lowercased()
+                      if s.contains("hoàn") || s.contains("trả") || s.contains("thất bại") { return Color.purple.opacity(0.25) }
+                      if s.contains("thành công") || s.contains("đã giao") || s.contains("ký nhận") { return Color.green.opacity(0.25) }
+                      if s.contains("đang giao") || s.contains("giao hàng") { return Color.blue.opacity(0.2) }
+                      return Color.yellow.opacity(0.25)
+                  }
+              }
+          }
+
+          struct OrderRow: View {
+              let order: Order
+              var body: some View {
+                  VStack(alignment: .leading, spacing: 3) {
+                      HStack {
+                          Text(order.code).font(.system(.subheadline, design: .monospaced)).bold()
+                          Text(order.carrier.rawValue).font(.caption2).padding(.horizontal, 6)
+                              .background(.secondary.opacity(0.2), in: Capsule())
+                          Spacer()
+                          if order.state == .loading { ProgressView() }
+                      }
+                      if !order.phone.isEmpty { Text("SĐT: \(order.phone)").font(.caption).foregroundStyle(.secondary) }
+                      switch order.state {
+                      case .error:
+                          Text("⚠️ \(order.errorMessage)").font(.footnote).foregroundStyle(.red)
+                      case .ok:
+                          Text(order.status).font(.footnote)
+                          if !order.lastTime.isEmpty { Text(order.lastTime).font(.caption2).foregroundStyle(.secondary) }
+                      default: EmptyView()
+                      }
+                      if !order.note.isEmpty { Text("📝 \(order.note)").font(.caption).foregroundStyle(.secondary) }
+                  }
+                  .padding(.vertical, 2)
+              }
+          }
+
+          struct AddSheet: View {
+              @EnvironmentObject var store: OrderStore
+              @Environment(\.dismiss) private var dismiss
+              @State private var text = ""
+              @State private var info = ""
+
+              var body: some View {
+                  NavigationStack {
+                      VStack(alignment: .leading, spacing: 8) {
+                          Text("Mỗi dòng 1 đơn: mã, sđt, ghi chú\nSPX: chỉ cần mã • J&T và GHN: cần thêm số điện thoại")
+                              .font(.footnote).foregroundStyle(.secondary)
+                          TextEditor(text: $text)
+                              .font(.system(.body, design: .monospaced))
+                              .overlay(RoundedRectangle(cornerRadius: 8).stroke(.secondary.opacity(0.4)))
+                              .autocorrectionDisabled().textInputAutocapitalization(.characters)
+                          if !info.isEmpty { Text(info).font(.footnote) }
+                      }
+                      .padding()
+                      .navigationTitle("Nhập list")
+                      .toolbar {
+                          ToolbarItem(placement: .navigationBarLeading) { Button("Đóng") { dismiss() } }
+                          ToolbarItemGroup(placement: .navigationBarTrailing) {
+                              Button("Paste") { text += (text.isEmpty ? "" : "\n") + (UIPasteboard.general.string ?? "") }
+                              Button("Thêm mã") {
+                                  let r = store.add(from: text)
+                                  info = "Đã thêm \(r.added), bỏ qua \(r.skipped) (sai mã/trùng)"
+                                  if r.skipped == 0 { dismiss() } else { text = "" }
+                              }.disabled(text.isEmpty)
+                          }
+                      }
+                  }
+              }
+          }
+
+          struct DelaySheet: View {
+              @EnvironmentObject var store: OrderStore
+              @Environment(\.dismiss) private var dismiss
+
+              var body: some View {
+                  NavigationStack {
+                      Form {
+                          Section("Thời gian nghỉ giữa 2 lần tra (ms)") {
+                              Stepper(value: $store.delayMs, in: 0...10000, step: 100) {
+                                  Text("\(store.delayMs) ms")
+                              }
+                              Slider(value: Binding(get: { Double(store.delayMs) },
+                                                    set: { store.delayMs = Int($0 / 50) * 50 }),
+                                     in: 0...3000)
+                              HStack {
+                                  ForEach([0, 300, 500, 1000, 1500], id: \.self) { v in
+                                      Button("\(v)") { store.delayMs = v }.buttonStyle(.bordered)
+                                  }
+                              }
+                              Text("Mạng tốt: 300–1000 ms hoặc 0. Nếu bị lỗi nhiều (bị chặn do tra quá nhanh) hãy tăng lên.")
+                                  .font(.footnote).foregroundStyle(.secondary)
+                          }
+                          Section("Tự động check lại đơn lỗi") {
+                              Stepper(value: $store.autoRetryRounds, in: 0...5) {
+                                  Text(store.autoRetryRounds == 0 ? "Tắt" : "\(store.autoRetryRounds) vòng sau khi chạy xong")
+                              }
+                          }
+                      }
+                      .navigationTitle("Set delay")
+                      .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Xong") { dismiss() } } }
+                  }
+              }
+          }
+
+          struct DetailSheet: View {
+              let order: Order
+              @Environment(\.dismiss) private var dismiss
+
+              var body: some View {
+                  NavigationStack {
+                      List {
+                          Section {
+                              LabeledContent("Mã", value: order.code)
+                              LabeledContent("ĐVVC", value: order.carrier.rawValue)
+                              if !order.phone.isEmpty { LabeledContent("SĐT", value: order.phone) }
+                              if !order.note.isEmpty { LabeledContent("Ghi chú", value: order.note) }
+                              if order.state == .error { Text(order.errorMessage).foregroundStyle(.red) }
+                          }
+                          Section("Hành trình") {
+                              if order.history.isEmpty { Text("Chưa có dữ liệu").foregroundStyle(.secondary) }
+                              ForEach(order.history, id: \.self) { e in
+                                  VStack(alignment: .leading, spacing: 2) {
+                                      Text(e.time).font(.caption).foregroundStyle(.secondary)
+                                      Text(e.text)
+                                  }
+                              }
+                          }
+                      }
+                      .navigationTitle("Chi tiết")
+                      .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Đóng") { dismiss() } } }
+                  }
+              }
+          }
+          CHECKDON_EOF
+          mkdir -p proj/$(dirname CheckDon/Models.swift)
+          cat > proj/CheckDon/Models.swift <<'CHECKDON_EOF'
+          import Foundation
+
+          enum Carrier: String, Codable, CaseIterable {
+              case spx = "SPX Express"
+              case jt = "J&T"
+              case ghn = "GHN"
+
+              var needsPhone: Bool { self != .spx }
+
+              /// Nhận diện ĐVVC theo độ dài/định dạng mã (giống app gốc)
+              static func detect(_ code: String) -> Carrier? {
+                  let n = code.count
+                  let digitsOnly = code.allSatisfy { $0.isASCII && $0.isNumber }
+                  if (14...20).contains(n) { return .spx }
+                  if (10...13).contains(n) && digitsOnly { return .jt }
+                  if (6...9).contains(n) { return .ghn }
+                  return nil
+              }
+          }
+
+          enum CheckState: String, Codable { case idle, loading, ok, error }
+
+          struct TrackEvent: Codable, Equatable, Hashable {
+              var time: String
+              var text: String
+          }
+
+          struct Order: Identifiable, Codable, Equatable {
+              var id = UUID()
+              var code: String
+              var phone: String = ""
+              var note: String = ""
+              var carrier: Carrier
+              var status: String = ""
+              var lastTime: String = ""
+              var state: CheckState = .idle
+              var errorMessage: String = ""
+              var history: [TrackEvent] = []
+          }
+
+          struct TrackResult {
+              var status: String
+              var time: String
+              var history: [TrackEvent]
+          }
+          CHECKDON_EOF
+          mkdir -p proj/$(dirname CheckDon/OrderStore.swift)
+          cat > proj/CheckDon/OrderStore.swift <<'CHECKDON_EOF'
+          import Foundation
+          import SwiftUI
+
+          @MainActor
+          final class OrderStore: ObservableObject {
+              @Published var orders: [Order] = []
+              @Published var isRunning = false
+              @Published var progress = ""
+
+              /// Thời gian nghỉ giữa 2 request (ms). Mặc định 1000, có thể hạ xuống 0 nếu mạng tốt.
+              @Published var delayMs: Int {
+                  didSet { UserDefaults.standard.set(delayMs, forKey: "DelayTime") }
+              }
+              /// Số vòng tự động check lại các đơn lỗi sau khi chạy xong (0 = tắt)
+              @Published var autoRetryRounds: Int {
+                  didSet { UserDefaults.standard.set(autoRetryRounds, forKey: "AutoRetryRounds") }
+              }
+
+              private var task: Task<Void, Never>?
+              private let fileURL: URL = FileManager.default
+                  .urls(for: .documentDirectory, in: .userDomainMask)[0]
+                  .appendingPathComponent("dulieu_donhang.json")
+
+              var failedCount: Int { orders.filter { $0.state == .error }.count }
+
+              init() {
+                  let d = UserDefaults.standard
+                  delayMs = d.object(forKey: "DelayTime") == nil ? 1000 : d.integer(forKey: "DelayTime")
+                  autoRetryRounds = d.integer(forKey: "AutoRetryRounds")
+                  load()
+              }
+
+              // MARK: Nhập dữ liệu
+              /// Mỗi dòng: mã, sđt, ghi chú (ngăn cách bằng , ; tab hoặc khoảng trắng)
+              @discardableResult
+              func add(from text: String) -> (added: Int, skipped: Int) {
+                  var added = 0, skipped = 0
+                  for line in text.components(separatedBy: .newlines) {
+                      let parts = line.split(whereSeparator: { ",;\t".contains($0) })
+                          .map { $0.trimmingCharacters(in: .whitespaces) }
+                          .filter { !$0.isEmpty }
+                      guard var code = parts.first else { continue }
+                      var rest = Array(parts.dropFirst())
+                      // hỗ trợ "MÃ SĐT" cách nhau bằng khoảng trắng
+                      if parts.count == 1 {
+                          let ws = code.split(separator: " ").map(String.init)
+                          if ws.count > 1 { code = ws[0]; rest = Array(ws.dropFirst()) }
+                      }
+                      code = code.uppercased()
+                      guard let carrier = Carrier.detect(code) else { skipped += 1; continue }
+                      if orders.contains(where: { $0.code == code }) { skipped += 1; continue }
+                      let phone = rest.first(where: { item in item.count >= 4 && item.allSatisfy { ch in ch.isNumber } }) ?? ""
+                      let note = rest.filter { $0 != phone }.joined(separator: " ")
+                      orders.append(Order(code: code, phone: phone, note: note, carrier: carrier))
+                      added += 1
+                  }
+                  save()
+                  return (added, skipped)
+              }
+
+              func remove(_ id: UUID) { orders.removeAll { $0.id == id }; save() }
+              func clearAll() { cancel(); orders.removeAll(); save() }
+
+              // MARK: Kiểm tra
+              func checkAll() { run(ids: orders.map(\.id)) }
+
+              /// Check lại riêng các đơn đang bị lỗi
+              func retryFailed() { run(ids: orders.filter { $0.state == .error }.map(\.id)) }
+
+              func check(_ id: UUID) { run(ids: [id]) }
+
+              func cancel() { task?.cancel() }
+
+              private func run(ids: [UUID]) {
+                  guard !isRunning, !ids.isEmpty else { return }
+                  isRunning = true
+                  task = Task {
+                      var pending = ids
+                      var round = 0
+                      while !pending.isEmpty && !Task.isCancelled {
+                          for (n, id) in pending.enumerated() {
+                              if Task.isCancelled { break }
+                              progress = (round == 0 ? "" : "Thử lại #\(round): ") + "\(n + 1)/\(pending.count)"
+                              await checkOne(id)
+                              if n < pending.count - 1, delayMs > 0, !Task.isCancelled {
+                                  try? await Task.sleep(nanoseconds: UInt64(delayMs) * 1_000_000)
+                              }
+                          }
+                          save()
+                          guard round < autoRetryRounds, !Task.isCancelled else { break }
+                          pending = orders.filter { $0.state == .error }.map(\.id)
+                          round += 1
+                          if !pending.isEmpty, delayMs > 0 {
+                              try? await Task.sleep(nanoseconds: UInt64(max(delayMs, 500)) * 1_000_000)
+                          }
+                      }
+                      isRunning = false
+                      progress = ""
+                      save()
+                  }
+              }
+
+              private func checkOne(_ id: UUID) async {
+                  guard let i = orders.firstIndex(where: { $0.id == id }) else { return }
+                  orders[i].state = .loading
+                  let snapshot = orders[i]
+                  do {
+                      let r = try await Tracker.track(snapshot)
+                      guard let j = orders.firstIndex(where: { $0.id == id }) else { return }
+                      orders[j].status = r.status
+                      orders[j].lastTime = r.time
+                      orders[j].history = r.history
+                      orders[j].state = .ok
+                      orders[j].errorMessage = ""
+                  } catch {
+                      guard let j = orders.firstIndex(where: { $0.id == id }) else { return }
+                      orders[j].state = .error
+                      orders[j].errorMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                  }
+              }
+
+              // MARK: Lưu / đọc
+              private func save() {
+                  if let d = try? JSONEncoder().encode(orders) { try? d.write(to: fileURL, options: .atomic) }
+              }
+              private func load() {
+                  guard let d = try? Data(contentsOf: fileURL),
+                        var list = try? JSONDecoder().decode([Order].self, from: d) else { return }
+                  for i in list.indices where list[i].state == .loading { list[i].state = .idle }
+                  orders = list
+              }
+
+              var exportText: String {
+                  orders.map { "\($0.code)\t\($0.phone)\t\($0.status)\t\($0.note)" }.joined(separator: "\n")
+              }
+          }
+          CHECKDON_EOF
+          mkdir -p proj/$(dirname CheckDon/Tracker.swift)
+          cat > proj/CheckDon/Tracker.swift <<'CHECKDON_EOF'
+          import Foundation
+          import SwiftSoup
+
+          enum TrackError: LocalizedError {
+              case needPhone, http(Int), noData, parse(String)
+              var errorDescription: String? {
+                  switch self {
+                  case .needPhone: return "Thiếu số điện thoại"
+                  case .http(let c): return "Lỗi HTTP \(c)"
+                  case .noData: return "Không có dữ liệu / mã sai"
+                  case .parse(let m): return "Lỗi đọc dữ liệu: \(m)"
+                  }
+              }
+          }
+
+          enum Tracker {
+              static let session: URLSession = {
+                  let c = URLSessionConfiguration.ephemeral
+                  c.timeoutIntervalForRequest = 15
+                  c.timeoutIntervalForResource = 30
+                  return URLSession(configuration: c)
+              }()
+
+              static let userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0"
+
+              static func track(_ o: Order) async throws -> TrackResult {
+                  switch o.carrier {
+                  case .spx: return try await spx(o.code)
+                  case .jt:
+                      guard !o.phone.isEmpty else { throw TrackError.needPhone }
+                      return try await jt(o.code, phone: o.phone)
+                  case .ghn:
+                      guard !o.phone.isEmpty else { throw TrackError.needPhone }
+                      return try await ghn(o.code, phone: o.phone)
+                  }
+              }
+
+              private static func send(_ req: URLRequest) async throws -> Data {
+                  var r = req
+                  r.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+                  r.setValue("vi,en-GB;q=0.9,en;q=0.8,en-US;q=0.7,vi-VN;q=0.6", forHTTPHeaderField: "Accept-Language")
+                  let (d, resp) = try await session.data(for: r)
+                  if let h = resp as? HTTPURLResponse, !(200..<300).contains(h.statusCode) {
+                      throw TrackError.http(h.statusCode)
+                  }
+                  return d
+              }
+
+              // MARK: SPX Express
+              private static func spx(_ code: String) async throws -> TrackResult {
+                  let enc = code.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? code
+                  guard let url = URL(string: "https://spx.vn/shipment/order/open/order/get_order_info?spx_tn=\(enc)&language_code=vi")
+                  else { throw TrackError.parse("URL") }
+                  let d = try await send(URLRequest(url: url))
+                  guard let root = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+                        let payload = root["data"] as? [String: Any],
+                        let info = payload["sls_tracking_info"] as? [String: Any],
+                        let recs = info["records"] as? [[String: Any]], !recs.isEmpty
+                  else { throw TrackError.noData }
+
+                  let fmt = DateFormatter()
+                  fmt.dateFormat = "dd/MM HH:mm"
+                  fmt.timeZone = TimeZone(identifier: "Asia/Ho_Chi_Minh")
+
+                  let items: [(Double, TrackEvent)] = recs.map { r in
+                      let ts = (r["actual_time"] as? NSNumber)?.doubleValue ?? 0
+                      let text = (r["buyer_description"] as? String) ?? ""
+                      return (ts, TrackEvent(time: ts > 0 ? fmt.string(from: Date(timeIntervalSince1970: ts)) : "", text: text))
+                  }.sorted { $0.0 > $1.0 }
+
+                  let events = items.map { $0.1 }
+                  guard let first = events.first else { throw TrackError.noData }
+                  return TrackResult(status: first.text, time: first.time, history: events)
+              }
+
+              // MARK: J&T Express (HTML)
+              private static func jt(_ code: String, phone: String) async throws -> TrackResult {
+                  var comps = URLComponents(string: "https://jtexpress.vn/vi/tracking")!
+                  comps.queryItems = [
+                      URLQueryItem(name: "type", value: "track"),
+                      URLQueryItem(name: "billcode", value: code),
+                      URLQueryItem(name: "cellphone", value: phone)
+                  ]
+                  var req = URLRequest(url: comps.url!)
+                  req.setValue("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", forHTTPHeaderField: "Accept")
+                  let d = try await send(req)
+                  let html = String(decoding: d, as: UTF8.self)
+
+                  var events: [TrackEvent] = []
+                  do {
+                      let doc = try SwiftSoup.parse(html)
+                      for item in try doc.select("div.result-vandon-item") {
+                          let time = (try? item.select("ion-icon[name=time-outline] ~ span").first()?.text()) ?? ""
+                          let date = (try? item.select("ion-icon[name=calendar-clear-outline] ~ span").first()?.text()) ?? ""
+                          let divs = item.children().array().filter { $0.tagName() == "div" }
+                          let text = divs.count > 1 ? ((try? divs[1].text()) ?? "") : ""
+                          events.append(TrackEvent(time: "\(time) \(date)".trimmingCharacters(in: .whitespaces), text: text))
+                      }
+                  } catch {
+                      throw TrackError.parse("HTML")
+                  }
+                  guard let first = events.first else { throw TrackError.noData }
+                  return TrackResult(status: first.text, time: first.time, history: events)
+              }
+
+              // MARK: Giao Hàng Nhanh
+              private static func ghn(_ code: String, phone: String) async throws -> TrackResult {
+                  guard let url = URL(string: "https://fe-online-gateway.ghn.vn/order-tracking/public-api/client/tracking-logs")
+                  else { throw TrackError.parse("URL") }
+                  var req = URLRequest(url: url)
+                  req.httpMethod = "POST"
+                  req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                  req.setValue("application/json", forHTTPHeaderField: "Accept")
+                  req.setValue("https://donhang.ghn.vn", forHTTPHeaderField: "Origin")
+                  req.setValue("https://donhang.ghn.vn/", forHTTPHeaderField: "Referer")
+                  req.httpBody = try JSONSerialization.data(withJSONObject: ["order_code": code, "phone_verify": phone])
+                  let d = try await send(req)
+
+                  guard let root = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+                        let payload = root["data"] as? [String: Any],
+                        let logs = payload["tracking_logs"] as? [[String: Any]], !logs.isEmpty
+                  else { throw TrackError.noData }
+
+                  let iso1 = ISO8601DateFormatter(); iso1.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+                  let iso2 = ISO8601DateFormatter(); iso2.formatOptions = [.withInternetDateTime]
+                  let out = DateFormatter(); out.dateFormat = "dd/MM HH:mm"
+                  out.timeZone = TimeZone(identifier: "Asia/Ho_Chi_Minh")
+
+                  let items: [(Date, TrackEvent)] = logs.map { l in
+                      let raw = (l["action_at"] as? String) ?? ""
+                      let date = iso1.date(from: raw) ?? iso2.date(from: raw) ?? .distantPast
+                      let status = (l["status_name"] as? String) ?? ""
+                      let addr = ((l["location"] as? [String: Any])?["address"] as? String) ?? ""
+                      let text = [status, addr].filter { !$0.isEmpty }.joined(separator: " - ")
+                      return (date, TrackEvent(time: date == .distantPast ? raw : out.string(from: date), text: text))
+                  }.sorted { $0.0 > $1.0 }
+
+                  let events = items.map { $0.1 }
+                  guard let first = events.first else { throw TrackError.noData }
+                  return TrackResult(status: first.text, time: first.time, history: events)
+              }
+          }
+          CHECKDON_EOF
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Generate Xcode project
+        working-directory: proj
+        run: xcodegen generate
+      - name: Build (unsigned)
+        working-directory: proj
+        run: |
+          xcodebuild -project CheckDon.xcodeproj -scheme CheckDon \
+            -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build
+      - name: Package IPA
+        working-directory: proj
+        run: |
+          mkdir -p Payload
+          cp -R build/Build/Products/Release-iphoneos/CheckDon.app Payload/
+          zip -qr CheckDon.ipa Payload
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CheckDon-ipa
+          path: proj/CheckDon.ipa
