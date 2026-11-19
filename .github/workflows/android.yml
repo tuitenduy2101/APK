@@ -1,26 +1,757 @@
 name: Android CI
 
 on:
+  workflow_dispatch: {}
   push:
-    branches: [ "main" ]
-  pull_request:
     branches: [ "main" ]
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
-
     steps:
-    - uses: actions/checkout@v4
-    - name: set up JDK 11
-      uses: actions/setup-java@v4
-      with:
-        java-version: '11'
-        distribution: 'temurin'
-        cache: gradle
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Write project files
+        run: |
+          mkdir -p proj/$(dirname app/build.gradle.kts)
+          cat > proj/app/build.gradle.kts <<'CHECKDON_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+              id("org.jetbrains.kotlin.plugin.compose")
+          }
 
-    - name: Grant execute permission for gradlew
-      run: chmod +x gradlew
-    - name: Build with Gradle
-      run: ./gradlew build
+          android {
+              namespace = "com.checkdon.app"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.checkdon.app"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "2.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+              buildFeatures { compose = true }
+          }
+
+          dependencies {
+              implementation(platform("androidx.compose:compose-bom:2024.09.00"))
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.material:material-icons-core")
+              implementation("androidx.activity:activity-compose:1.9.2")
+              implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.6")
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("com.squareup.okhttp3:okhttp:4.12.0")
+              implementation("org.jsoup:jsoup:1.17.2")
+          }
+          CHECKDON_EOF
+          mkdir -p proj/$(dirname app/src/main/AndroidManifest.xml)
+          cat > proj/app/src/main/AndroidManifest.xml <<'CHECKDON_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <application
+                  android:allowBackup="true"
+                  android:label="Check Đơn"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar"
+                  android:usesCleartextTraffic="false">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          CHECKDON_EOF
+          mkdir -p proj/$(dirname app/src/main/java/com/checkdon/app/MainActivity.kt)
+          cat > proj/app/src/main/java/com/checkdon/app/MainActivity.kt <<'CHECKDON_EOF'
+          package com.checkdon.app
+
+          import android.os.Build
+          import android.os.Bundle
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.setContent
+          import androidx.compose.foundation.isSystemInDarkTheme
+          import androidx.compose.material3.MaterialTheme
+          import androidx.compose.material3.darkColorScheme
+          import androidx.compose.material3.dynamicDarkColorScheme
+          import androidx.compose.material3.dynamicLightColorScheme
+          import androidx.compose.material3.lightColorScheme
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.lifecycle.viewmodel.compose.viewModel
+
+          class MainActivity : ComponentActivity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContent {
+                      val dark = isSystemInDarkTheme()
+                      val ctx = LocalContext.current
+                      val scheme = when {
+                          Build.VERSION.SDK_INT >= Build.VERSION_CODES.S ->
+                              if (dark) dynamicDarkColorScheme(ctx) else dynamicLightColorScheme(ctx)
+                          dark -> darkColorScheme()
+                          else -> lightColorScheme()
+                      }
+                      MaterialTheme(colorScheme = scheme) { CheckDonApp(viewModel()) }
+                  }
+              }
+          }
+          CHECKDON_EOF
+          mkdir -p proj/$(dirname app/src/main/java/com/checkdon/app/Models.kt)
+          cat > proj/app/src/main/java/com/checkdon/app/Models.kt <<'CHECKDON_EOF'
+          package com.checkdon.app
+
+          import java.util.UUID
+
+          enum class Carrier(val label: String, val needsPhone: Boolean) {
+              SPX("SPX Express", false), JT("J&T", true), GHN("GHN", true);
+
+              companion object {
+                  /** Nhận diện ĐVVC theo độ dài/định dạng mã (giống app gốc) */
+                  fun detect(code: String): Carrier? {
+                      val n = code.length
+                      val digits = code.all { it in '0'..'9' }
+                      return when {
+                          n in 14..20 -> SPX
+                          n in 10..13 && digits -> JT
+                          n in 6..9 -> GHN
+                          else -> null
+                      }
+                  }
+              }
+          }
+
+          enum class CheckState { IDLE, LOADING, OK, ERROR }
+
+          enum class Category(val label: String) {
+              PENDING("Chưa tra"), SHIPPING("Đang đi"), DONE("Thành công"), RETURNED("Hoàn/Trả"), ERROR("Lỗi")
+          }
+
+          data class TrackEvent(val time: String, val text: String)
+
+          data class Order(
+              val id: String = UUID.randomUUID().toString(),
+              val code: String,
+              val phone: String = "",
+              val note: String = "",
+              val carrier: Carrier,
+              val status: String = "",
+              val lastTime: String = "",
+              val state: CheckState = CheckState.IDLE,
+              val error: String = "",
+              val history: List<TrackEvent> = emptyList(),
+          ) {
+              fun category(): Category = when (state) {
+                  CheckState.ERROR -> Category.ERROR
+                  CheckState.IDLE, CheckState.LOADING -> Category.PENDING
+                  CheckState.OK -> {
+                      val s = status.lowercase()
+                      when {
+                          "hoàn" in s || "trả" in s || "thất bại" in s -> Category.RETURNED
+                          "thành công" in s || "đã giao" in s || "ký nhận" in s -> Category.DONE
+                          else -> Category.SHIPPING
+                      }
+                  }
+              }
+          }
+
+          data class TrackResult(val status: String, val time: String, val history: List<TrackEvent>)
+          CHECKDON_EOF
+          mkdir -p proj/$(dirname app/src/main/java/com/checkdon/app/OrderViewModel.kt)
+          cat > proj/app/src/main/java/com/checkdon/app/OrderViewModel.kt <<'CHECKDON_EOF'
+          package com.checkdon.app
+
+          import android.app.Application
+          import android.content.Context
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableIntStateOf
+          import androidx.compose.runtime.mutableStateListOf
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.setValue
+          import androidx.lifecycle.AndroidViewModel
+          import androidx.lifecycle.viewModelScope
+          import kotlinx.coroutines.CancellationException
+          import kotlinx.coroutines.Job
+          import kotlinx.coroutines.delay
+          import kotlinx.coroutines.launch
+          import org.json.JSONArray
+          import org.json.JSONObject
+
+          class OrderViewModel(app: Application) : AndroidViewModel(app) {
+              private val prefs = app.getSharedPreferences("checkdon", Context.MODE_PRIVATE)
+
+              val orders = mutableStateListOf<Order>()
+
+              /** Thời gian nghỉ giữa 2 request (ms) */
+              var delayMs by mutableIntStateOf(prefs.getInt("DelayTime", 1000)); private set
+              /** Số vòng tự động check lại đơn lỗi sau khi chạy xong */
+              var autoRetry by mutableIntStateOf(prefs.getInt("AutoRetry", 0)); private set
+              var running by mutableStateOf(false); private set
+              var progress by mutableStateOf(""); private set
+
+              private var job: Job? = null
+
+              init { load() }
+
+              val failedCount get() = orders.count { it.state == CheckState.ERROR }
+
+              fun updateDelay(v: Int) { delayMs = v.coerceIn(0, 10000); prefs.edit().putInt("DelayTime", delayMs).apply() }
+              fun updateAutoRetry(v: Int) { autoRetry = v.coerceIn(0, 5); prefs.edit().putInt("AutoRetry", autoRetry).apply() }
+
+              // ---------- nhập dữ liệu ----------
+              /** Mỗi dòng: mã, sđt, ghi chú (ngăn cách bằng , ; tab hoặc khoảng trắng). Trả về (đã thêm, bỏ qua) */
+              fun add(text: String): Pair<Int, Int> {
+                  var added = 0; var skipped = 0
+                  for (line in text.lines()) {
+                      var parts = line.split(',', ';', '\t').map { it.trim() }.filter { it.isNotEmpty() }
+                      if (parts.size == 1) parts = parts[0].split(Regex("\\s+")).filter { it.isNotEmpty() }
+                      val code = parts.firstOrNull()?.uppercase() ?: continue
+                      val carrier = Carrier.detect(code)
+                      if (carrier == null || orders.any { it.code == code }) { skipped++; continue }
+                      val rest = parts.drop(1)
+                      val phone = rest.firstOrNull { p -> p.length >= 4 && p.all { it.isDigit() } } ?: ""
+                      val note = rest.filter { it != phone }.joinToString(" ")
+                      orders.add(Order(code = code, phone = phone, note = note, carrier = carrier))
+                      added++
+                  }
+                  save()
+                  return added to skipped
+              }
+
+              fun remove(id: String) { orders.removeAll { it.id == id }; save() }
+              fun clearAll() { cancel(); orders.clear(); save() }
+              fun exportText() = orders.joinToString("\n") { "${it.code}\t${it.phone}\t${it.status}\t${it.note}" }
+
+              // ---------- kiểm tra ----------
+              fun checkAll() = run(orders.map { it.id })
+              /** Check lại riêng các đơn đang bị lỗi */
+              fun retryFailed() = run(orders.filter { it.state == CheckState.ERROR }.map { it.id })
+              fun check(id: String) = run(listOf(id))
+              fun cancel() { job?.cancel() }
+
+              private fun run(ids: List<String>) {
+                  if (running || ids.isEmpty()) return
+                  running = true
+                  job = viewModelScope.launch {
+                      try {
+                          var pending = ids
+                          var round = 0
+                          while (pending.isNotEmpty()) {
+                              pending.forEachIndexed { n, id ->
+                                  progress = (if (round == 0) "" else "Thử lại #$round · ") + "${n + 1}/${pending.size}"
+                                  checkOne(id)
+                                  if (n < pending.size - 1 && delayMs > 0) delay(delayMs.toLong())
+                              }
+                              save()
+                              if (round >= autoRetry) break
+                              pending = orders.filter { it.state == CheckState.ERROR }.map { it.id }
+                              round++
+                              if (pending.isNotEmpty()) delay(maxOf(delayMs, 500).toLong())
+                          }
+                      } finally {
+                          for (i in orders.indices) if (orders[i].state == CheckState.LOADING) orders[i] = orders[i].copy(state = CheckState.IDLE)
+                          running = false
+                          progress = ""
+                          save()
+                      }
+                  }
+              }
+
+              private fun idx(id: String) = orders.indexOfFirst { it.id == id }
+
+              private suspend fun checkOne(id: String) {
+                  var i = idx(id).takeIf { it >= 0 } ?: return
+                  orders[i] = orders[i].copy(state = CheckState.LOADING)
+                  val snapshot = orders[i]
+                  try {
+                      val r = Tracker.track(snapshot)
+                      i = idx(id).takeIf { it >= 0 } ?: return
+                      orders[i] = orders[i].copy(status = r.status, lastTime = r.time, history = r.history, state = CheckState.OK, error = "")
+                  } catch (e: CancellationException) {
+                      throw e
+                  } catch (e: Exception) {
+                      i = idx(id).takeIf { it >= 0 } ?: return
+                      orders[i] = orders[i].copy(state = CheckState.ERROR, error = e.message ?: "Lỗi mạng")
+                  }
+              }
+
+              // ---------- lưu / đọc ----------
+              private fun save() {
+                  val arr = JSONArray()
+                  orders.forEach { o ->
+                      arr.put(JSONObject()
+                          .put("id", o.id).put("code", o.code).put("phone", o.phone).put("note", o.note)
+                          .put("carrier", o.carrier.name).put("status", o.status).put("lastTime", o.lastTime)
+                          .put("state", o.state.name).put("error", o.error)
+                          .put("history", JSONArray().also { h ->
+                              o.history.forEach { e -> h.put(JSONObject().put("t", e.time).put("x", e.text)) }
+                          }))
+                  }
+                  prefs.edit().putString("orders", arr.toString()).apply()
+              }
+
+              private fun load() {
+                  val s = prefs.getString("orders", null) ?: return
+                  runCatching {
+                      val arr = JSONArray(s)
+                      for (i in 0 until arr.length()) {
+                          val j = arr.getJSONObject(i)
+                          val h = j.optJSONArray("history") ?: JSONArray()
+                          val st = CheckState.valueOf(j.getString("state"))
+                          orders.add(Order(
+                              id = j.getString("id"), code = j.getString("code"), phone = j.optString("phone"),
+                              note = j.optString("note"), carrier = Carrier.valueOf(j.getString("carrier")),
+                              status = j.optString("status"), lastTime = j.optString("lastTime"),
+                              state = if (st == CheckState.LOADING) CheckState.IDLE else st, error = j.optString("error"),
+                              history = (0 until h.length()).map { TrackEvent(h.getJSONObject(it).optString("t"), h.getJSONObject(it).optString("x")) },
+                          ))
+                      }
+                  }
+              }
+          }
+          CHECKDON_EOF
+          mkdir -p proj/$(dirname app/src/main/java/com/checkdon/app/Tracker.kt)
+          cat > proj/app/src/main/java/com/checkdon/app/Tracker.kt <<'CHECKDON_EOF'
+          package com.checkdon.app
+
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.withContext
+          import okhttp3.MediaType.Companion.toMediaType
+          import okhttp3.OkHttpClient
+          import okhttp3.Request
+          import okhttp3.RequestBody.Companion.toRequestBody
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import org.jsoup.Jsoup
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+          import java.util.TimeZone
+          import java.util.concurrent.TimeUnit
+
+          class TrackException(msg: String) : Exception(msg)
+
+          object Tracker {
+              private val client = OkHttpClient.Builder()
+                  .connectTimeout(15, TimeUnit.SECONDS)
+                  .readTimeout(15, TimeUnit.SECONDS)
+                  .build()
+
+              private const val UA =
+                  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0"
+
+              private val vn = TimeZone.getTimeZone("Asia/Ho_Chi_Minh")
+              private fun fmt(ms: Long): String =
+                  SimpleDateFormat("dd/MM HH:mm", Locale.US).apply { timeZone = vn }.format(Date(ms))
+
+              suspend fun track(o: Order): TrackResult = withContext(Dispatchers.IO) {
+                  when (o.carrier) {
+                      Carrier.SPX -> spx(o.code)
+                      Carrier.JT -> { need(o); jt(o.code, o.phone) }
+                      Carrier.GHN -> { need(o); ghn(o.code, o.phone) }
+                  }
+              }
+
+              private fun need(o: Order) { if (o.phone.isBlank()) throw TrackException("Thiếu số điện thoại") }
+
+              private fun call(req: Request): String {
+                  val r = req.newBuilder()
+                      .header("User-Agent", UA)
+                      .header("Accept-Language", "vi,en-GB;q=0.9,en;q=0.8")
+                      .build()
+                  client.newCall(r).execute().use { resp ->
+                      if (!resp.isSuccessful) throw TrackException("Lỗi HTTP ${resp.code}")
+                      return resp.body?.string() ?: ""
+                  }
+              }
+
+              private fun done(events: List<TrackEvent>): TrackResult {
+                  val first = events.firstOrNull() ?: throw TrackException("Không có dữ liệu / mã sai")
+                  return TrackResult(first.text, first.time, events)
+              }
+
+              // ---- SPX Express ----
+              private fun spx(code: String): TrackResult {
+                  val url = "https://spx.vn/shipment/order/open/order/get_order_info?spx_tn=" +
+                      java.net.URLEncoder.encode(code, "UTF-8") + "&language_code=vi"
+                  val recs: JSONArray = JSONObject(call(Request.Builder().url(url).build()))
+                      .optJSONObject("data")?.optJSONObject("sls_tracking_info")?.optJSONArray("records")
+                      ?: throw TrackException("Không có dữ liệu / mã sai")
+                  val list = (0 until recs.length()).map { recs.getJSONObject(it) }
+                      .sortedByDescending { it.optLong("actual_time") }
+                      .map {
+                          val ts = it.optLong("actual_time")
+                          TrackEvent(if (ts > 0) fmt(ts * 1000) else "", it.optString("buyer_description"))
+                      }
+                  return done(list)
+              }
+
+              // ---- J&T Express (HTML) ----
+              private fun jt(code: String, phone: String): TrackResult {
+                  val url = okhttp3.HttpUrl.Builder().scheme("https").host("jtexpress.vn")
+                      .addPathSegments("vi/tracking")
+                      .addQueryParameter("type", "track")
+                      .addQueryParameter("billcode", code)
+                      .addQueryParameter("cellphone", phone).build()
+                  val html = call(Request.Builder().url(url).build())
+                  val events = Jsoup.parse(html).select("div.result-vandon-item").map { item ->
+                      val time = item.selectFirst("ion-icon[name=time-outline] ~ span")?.text().orEmpty()
+                      val date = item.selectFirst("ion-icon[name=calendar-clear-outline] ~ span")?.text().orEmpty()
+                      val text = item.children().filter { it.tagName() == "div" }.getOrNull(1)?.text().orEmpty()
+                      TrackEvent("$time $date".trim(), text)
+                  }
+                  return done(events)
+              }
+
+              // ---- Giao Hàng Nhanh ----
+              private fun ghn(code: String, phone: String): TrackResult {
+                  val body = JSONObject().put("order_code", code).put("phone_verify", phone).toString()
+                      .toRequestBody("application/json".toMediaType())
+                  val req = Request.Builder()
+                      .url("https://fe-online-gateway.ghn.vn/order-tracking/public-api/client/tracking-logs")
+                      .post(body)
+                      .header("Accept", "application/json")
+                      .header("Origin", "https://donhang.ghn.vn")
+                      .header("Referer", "https://donhang.ghn.vn/")
+                      .build()
+                  val logs = JSONObject(call(req)).optJSONObject("data")?.optJSONArray("tracking_logs")
+                      ?: throw TrackException("Không có dữ liệu / mã sai")
+                  val utc = TimeZone.getTimeZone("UTC")
+                  val parser = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.US).apply { timeZone = utc }
+                  val items = (0 until logs.length()).map { logs.getJSONObject(it) }.map { l ->
+                      val raw = l.optString("action_at")
+                      val ms = runCatching { parser.parse(raw.take(19))!!.time }.getOrDefault(0L)
+                      val status = l.optString("status_name")
+                      val addr = l.optJSONObject("location")?.optString("address").orEmpty()
+                      ms to TrackEvent(if (ms > 0) fmt(ms) else raw, listOf(status, addr).filter { it.isNotBlank() }.joinToString(" - "))
+                  }.sortedByDescending { it.first }.map { it.second }
+                  return done(items)
+              }
+          }
+          CHECKDON_EOF
+          mkdir -p proj/$(dirname app/src/main/java/com/checkdon/app/Ui.kt)
+          cat > proj/app/src/main/java/com/checkdon/app/Ui.kt <<'CHECKDON_EOF'
+          @file:OptIn(ExperimentalMaterial3Api::class)
+
+          package com.checkdon.app
+
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.horizontalScroll
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.foundation.shape.CircleShape
+          import androidx.compose.foundation.verticalScroll
+          import androidx.compose.material.icons.Icons
+          import androidx.compose.material.icons.filled.*
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.graphics.compositeOver
+          import androidx.compose.ui.platform.LocalClipboardManager
+          import androidx.compose.ui.text.AnnotatedString
+          import androidx.compose.ui.text.font.FontFamily
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.unit.dp
+          import kotlinx.coroutines.launch
+
+          private fun Category.color(): Color = when (this) {
+              Category.DONE -> Color(0xFF2E7D32)
+              Category.SHIPPING -> Color(0xFF1565C0)
+              Category.RETURNED -> Color(0xFF6A1B9A)
+              Category.ERROR -> Color(0xFFC62828)
+              Category.PENDING -> Color(0xFF757575)
+          }
+
+          @Composable
+          fun CheckDonApp(vm: OrderViewModel) {
+              var showAdd by remember { mutableStateOf(false) }
+              var showSettings by remember { mutableStateOf(false) }
+              var confirmClear by remember { mutableStateOf(false) }
+              var menuOpen by remember { mutableStateOf(false) }
+              var selectedId by remember { mutableStateOf<String?>(null) }
+              var filter by remember { mutableStateOf<Category?>(null) }
+
+              val snack = remember { SnackbarHostState() }
+              val scope = rememberCoroutineScope()
+              val clip = LocalClipboardManager.current
+              fun copy(s: String) {
+                  clip.setText(AnnotatedString(s))
+                  scope.launch { snack.currentSnackbarData?.dismiss(); snack.showSnackbar("Đã copy!") }
+              }
+
+              val shown = vm.orders.filter { filter == null || it.category() == filter }
+
+              Scaffold(
+                  snackbarHost = { SnackbarHost(snack) },
+                  topBar = {
+                      TopAppBar(
+                          title = {
+                              Column {
+                                  Text("Check Đơn", fontWeight = FontWeight.Bold)
+                                  Text("Delay ${vm.delayMs} ms" + if (vm.autoRetry > 0) " · tự thử lại ${vm.autoRetry} vòng" else "",
+                                      style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                              }
+                          },
+                          actions = {
+                              IconButton(onClick = { showSettings = true }) { Icon(Icons.Default.Settings, "Set delay") }
+                              Box {
+                                  IconButton(onClick = { menuOpen = true }) { Icon(Icons.Default.MoreVert, "Thêm") }
+                                  DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                                      DropdownMenuItem(text = { Text("Copy danh sách") }, onClick = { menuOpen = false; copy(vm.exportText()) })
+                                      DropdownMenuItem(text = { Text("Xoá sạch") }, onClick = { menuOpen = false; confirmClear = true })
+                                  }
+                              }
+                          },
+                      )
+                  },
+                  floatingActionButton = {
+                      ExtendedFloatingActionButton(onClick = { showAdd = true }, icon = { Icon(Icons.Default.Add, null) }, text = { Text("Thêm mã") })
+                  },
+                  bottomBar = {
+                      Surface(tonalElevation = 3.dp) {
+                          Column(Modifier.navigationBarsPadding()) {
+                              if (vm.running) {
+                                  LinearProgressIndicator(Modifier.fillMaxWidth())
+                                  Text("Đang kiểm tra… ${vm.progress}", Modifier.padding(start = 16.dp, top = 6.dp), style = MaterialTheme.typography.labelMedium)
+                              }
+                              Row(Modifier.padding(12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                  if (vm.running) {
+                                      Button(onClick = { vm.cancel() }, Modifier.weight(1f),
+                                          colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)) {
+                                          Icon(Icons.Default.Close, null); Spacer(Modifier.width(6.dp)); Text("Dừng")
+                                      }
+                                  } else {
+                                      Button(onClick = { vm.checkAll() }, Modifier.weight(1f), enabled = vm.orders.isNotEmpty()) {
+                                          Icon(Icons.Default.Search, null); Spacer(Modifier.width(6.dp)); Text("Lấy data")
+                                      }
+                                      FilledTonalButton(onClick = { vm.retryFailed() }, Modifier.weight(1f), enabled = vm.failedCount > 0) {
+                                          Icon(Icons.Default.Refresh, null); Spacer(Modifier.width(6.dp)); Text("Check lại (${vm.failedCount})")
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  },
+              ) { pad ->
+                  Column(Modifier.padding(pad).fillMaxSize()) {
+                      // bộ lọc theo trạng thái
+                      Row(Modifier.horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp, vertical = 6.dp),
+                          horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                          FilterChip(selected = filter == null, onClick = { filter = null }, label = { Text("Tất cả ${vm.orders.size}") })
+                          Category.values().forEach { c ->
+                              val n = vm.orders.count { it.category() == c }
+                              if (n > 0) FilterChip(
+                                  selected = filter == c, onClick = { filter = if (filter == c) null else c },
+                                  label = { Text("${c.label} $n") },
+                                  leadingIcon = { Box(Modifier.size(10.dp).clip(CircleShape).background(c.color())) },
+                              )
+                          }
+                      }
+                      if (shown.isEmpty()) {
+                          Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                              Text(if (vm.orders.isEmpty()) "Chưa có mã vận đơn.\nBấm “Thêm mã” để nhập danh sách." else "Không có đơn nào trong mục này.",
+                                  color = MaterialTheme.colorScheme.onSurfaceVariant)
+                          }
+                      } else {
+                          LazyColumn(contentPadding = PaddingValues(12.dp, 4.dp, 12.dp, 96.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                              items(shown, key = { it.id }) { o ->
+                                  OrderCard(o, onClick = { selectedId = o.id }, onRecheck = { vm.check(o.id) }, onDelete = { vm.remove(o.id) }, enabled = !vm.running)
+                              }
+                          }
+                      }
+                  }
+              }
+
+              if (showAdd) AddSheet(vm) { showAdd = false }
+              if (showSettings) SettingsDialog(vm) { showSettings = false }
+              selectedId?.let { id ->
+                  vm.orders.firstOrNull { it.id == id }?.let { o ->
+                      DetailSheet(o, onCopy = ::copy, onRecheck = { vm.check(o.id) }, canRecheck = !vm.running) { selectedId = null }
+                  }
+              }
+              if (confirmClear) AlertDialog(
+                  onDismissRequest = { confirmClear = false },
+                  title = { Text("Xoá toàn bộ danh sách?") },
+                  confirmButton = { TextButton(onClick = { vm.clearAll(); confirmClear = false }) { Text("Xoá sạch") } },
+                  dismissButton = { TextButton(onClick = { confirmClear = false }) { Text("Huỷ") } },
+              )
+          }
+
+          @Composable
+          private fun OrderCard(o: Order, onClick: () -> Unit, onRecheck: () -> Unit, onDelete: () -> Unit, enabled: Boolean) {
+              val accent = o.category().color()
+              Card(
+                  onClick = onClick,
+                  colors = CardDefaults.cardColors(containerColor = accent.copy(alpha = 0.10f).compositeOver(MaterialTheme.colorScheme.surface)),
+              ) {
+                  Row(Modifier.height(IntrinsicSize.Min)) {
+                      Box(Modifier.width(5.dp).fillMaxHeight().background(accent))
+                      Column(Modifier.weight(1f).padding(start = 12.dp, top = 10.dp, bottom = 10.dp)) {
+                          Row(verticalAlignment = Alignment.CenterVertically) {
+                              Text(o.code, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold)
+                              Spacer(Modifier.width(8.dp))
+                              AssistChip(onClick = onClick, label = { Text(o.carrier.label, style = MaterialTheme.typography.labelSmall) }, modifier = Modifier.height(24.dp))
+                          }
+                          if (o.phone.isNotBlank()) Text("SĐT: ${o.phone}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                          when (o.state) {
+                              CheckState.LOADING -> Text("Đang kiểm tra…", style = MaterialTheme.typography.bodyMedium)
+                              CheckState.ERROR -> Text("⚠ ${o.error}", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium)
+                              CheckState.OK -> {
+                                  Text(o.status, style = MaterialTheme.typography.bodyMedium, maxLines = 3)
+                                  if (o.lastTime.isNotBlank()) Text(o.lastTime, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                              }
+                              CheckState.IDLE -> {}
+                          }
+                          if (o.note.isNotBlank()) Text("📝 ${o.note}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                      }
+                      Column {
+                          IconButton(onClick = onRecheck, enabled = enabled) { Icon(Icons.Default.Refresh, "Check lại") }
+                          IconButton(onClick = onDelete) { Icon(Icons.Default.Delete, "Xoá") }
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          private fun AddSheet(vm: OrderViewModel, onClose: () -> Unit) {
+              var text by remember { mutableStateOf("") }
+              var info by remember { mutableStateOf("") }
+              val clip = LocalClipboardManager.current
+              ModalBottomSheet(onDismissRequest = onClose) {
+                  Column(Modifier.padding(horizontal = 16.dp).padding(bottom = 24.dp).navigationBarsPadding().imePadding(), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                      Text("Nhập danh sách mã vận đơn", style = MaterialTheme.typography.titleMedium)
+                      Text("Mỗi dòng 1 đơn: mã, sđt, ghi chú\nSPX chỉ cần mã • J&T và GHN cần thêm số điện thoại",
+                          style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                      OutlinedTextField(value = text, onValueChange = { text = it }, modifier = Modifier.fillMaxWidth().heightIn(min = 140.dp),
+                          placeholder = { Text("SPXVN0123456789, 0912345678, khách A") })
+                      if (info.isNotEmpty()) Text(info, style = MaterialTheme.typography.bodySmall)
+                      Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                          OutlinedButton(onClick = { clip.getText()?.text?.let { text += (if (text.isEmpty()) "" else "\n") + it } }) { Text("Dán") }
+                          Button(modifier = Modifier.weight(1f), enabled = text.isNotBlank(), onClick = {
+                              val (a, s) = vm.add(text)
+                              if (s == 0) onClose() else { info = "Đã thêm $a, bỏ qua $s (sai mã/trùng)"; text = "" }
+                          }) { Text("Thêm mã") }
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          private fun SettingsDialog(vm: OrderViewModel, onClose: () -> Unit) {
+              AlertDialog(
+                  onDismissRequest = onClose,
+                  title = { Text("Cài đặt tra cứu") },
+                  text = {
+                      Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                          Text("Delay giữa 2 lần tra: ${vm.delayMs} ms", fontWeight = FontWeight.Medium)
+                          Slider(value = vm.delayMs.toFloat(), onValueChange = { vm.updateDelay((it / 50).toInt() * 50) }, valueRange = 0f..3000f, steps = 59)
+                          Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                              listOf(0, 300, 500, 1000, 1500).forEach { v ->
+                                  FilterChip(selected = vm.delayMs == v, onClick = { vm.updateDelay(v) }, label = { Text("$v") })
+                              }
+                          }
+                          Text("Mạng tốt: 300–1000 ms hoặc 0. Bị lỗi nhiều (tra quá nhanh) thì tăng lên.",
+                              style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                          Spacer(Modifier.height(8.dp))
+                          Text(if (vm.autoRetry == 0) "Tự động check lại đơn lỗi: Tắt" else "Tự động check lại đơn lỗi: ${vm.autoRetry} vòng", fontWeight = FontWeight.Medium)
+                          Slider(value = vm.autoRetry.toFloat(), onValueChange = { vm.updateAutoRetry(it.toInt()) }, valueRange = 0f..5f, steps = 4)
+                      }
+                  },
+                  confirmButton = { TextButton(onClick = onClose) { Text("Xong") } },
+              )
+          }
+
+          @Composable
+          private fun DetailSheet(o: Order, onCopy: (String) -> Unit, onRecheck: () -> Unit, canRecheck: Boolean, onClose: () -> Unit) {
+              val accent = o.category().color()
+              ModalBottomSheet(onDismissRequest = onClose) {
+                  Column(Modifier.verticalScroll(rememberScrollState()).padding(horizontal = 16.dp).padding(bottom = 24.dp).navigationBarsPadding(),
+                      verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                      Text(o.code, style = MaterialTheme.typography.titleLarge, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold)
+                      Text("${o.carrier.label}" + (if (o.phone.isNotBlank()) " · ${o.phone}" else "") + (if (o.note.isNotBlank()) " · ${o.note}" else ""),
+                          color = MaterialTheme.colorScheme.onSurfaceVariant)
+                      if (o.state == CheckState.ERROR) Text("⚠ ${o.error}", color = MaterialTheme.colorScheme.error)
+                      Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                          OutlinedButton(onClick = { onCopy(o.code) }) { Text("Copy mã") }
+                          OutlinedButton(onClick = { onCopy(o.status) }, enabled = o.status.isNotBlank()) { Text("Copy tình trạng") }
+                          FilledTonalButton(onClick = onRecheck, enabled = canRecheck) { Text("Check lại") }
+                      }
+                      Spacer(Modifier.height(6.dp))
+                      Text("Hành trình", style = MaterialTheme.typography.titleMedium)
+                      if (o.history.isEmpty()) Text("Chưa có dữ liệu", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                      o.history.forEachIndexed { i, e ->
+                          Row(Modifier.height(IntrinsicSize.Min)) {
+                              Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.width(20.dp)) {
+                                  Box(Modifier.padding(top = 5.dp).size(10.dp).clip(CircleShape).background(if (i == 0) accent else MaterialTheme.colorScheme.outline))
+                                  if (i < o.history.lastIndex) Box(Modifier.width(2.dp).weight(1f).background(MaterialTheme.colorScheme.outlineVariant))
+                              }
+                              Column(Modifier.padding(start = 8.dp, bottom = 12.dp)) {
+                                  Text(e.time, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                  Text(e.text, fontWeight = if (i == 0) FontWeight.SemiBold else FontWeight.Normal)
+                              }
+                          }
+                      }
+                  }
+              }
+          }
+          CHECKDON_EOF
+          mkdir -p proj/$(dirname build.gradle.kts)
+          cat > proj/build.gradle.kts <<'CHECKDON_EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.20" apply false
+              id("org.jetbrains.kotlin.plugin.compose") version "2.0.20" apply false
+          }
+          CHECKDON_EOF
+          mkdir -p proj/$(dirname gradle.properties)
+          cat > proj/gradle.properties <<'CHECKDON_EOF'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+          kotlin.code.style=official
+          CHECKDON_EOF
+          mkdir -p proj/$(dirname gradle/wrapper/gradle-wrapper.properties)
+          cat > proj/gradle/wrapper/gradle-wrapper.properties <<'CHECKDON_EOF'
+          distributionBase=GRADLE_USER_HOME
+          distributionPath=wrapper/dists
+          distributionUrl=https\://services.gradle.org/distributions/gradle-8.9-bin.zip
+          zipStoreBase=GRADLE_USER_HOME
+          zipStorePath=wrapper/dists
+          CHECKDON_EOF
+          mkdir -p proj/$(dirname settings.gradle.kts)
+          cat > proj/settings.gradle.kts <<'CHECKDON_EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "CheckDon"
+          include(":app")
+          CHECKDON_EOF
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+      - name: Build APK
+        run: gradle -p proj assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CheckDon-apk
+          path: proj/app/build/outputs/apk/debug/app-debug.apk
